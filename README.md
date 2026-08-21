@@ -1,4 +1,4 @@
-# Manifestos Kubernetes (YAMLs Validados)
+# Manifestos Kubernetes
 
 001 - Portainer:
 kubectl apply -f https://raw.githubusercontent.com/aranfveras/yaml/refs/heads/main/001-portainer.yaml
