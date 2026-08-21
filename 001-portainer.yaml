@@ -1,0 +1,149 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: portainer
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: portainer-sa
+  namespace: portainer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: portainer-cluster-admin
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-admin
+subjects:
+- kind: ServiceAccount
+  name: portainer-sa
+  namespace: portainer
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: portainer-pvc
+  namespace: portainer
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: portainer
+  namespace: portainer
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: portainer
+  template:
+    metadata:
+      labels:
+        app: portainer
+    spec:
+      serviceAccountName: portainer-sa
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      containers:
+      - name: portainer
+        image: portainer/portainer-ce:lts
+        args:
+        - "--no-setup-token"
+        ports:
+        - containerPort: 9000
+          name: http
+        - containerPort: 9443
+          name: https
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - name: data
+          mountPath: /data
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: portainer-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: portainer
+  namespace: portainer
+spec:
+  selector:
+    app: portainer
+  ports:
+  - name: http
+    port: 9000
+    targetPort: 9000
+  - name: https
+    port: 9443
+    targetPort: 9443
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: portainer-local-issuer
+  namespace: portainer
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: portainer-cert
+  namespace: portainer
+spec:
+  secretName: portainer-tls
+  dnsNames:
+  - portainer.app.local
+  issuerRef:
+    name: portainer-local-issuer
+    kind: Issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: portainer-ingress
+  namespace: portainer
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/service.serversscheme: http
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - portainer.app.local
+    secretName: portainer-tls
+  rules:
+  - host: portainer.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: portainer
+            port:
+              number: 9000

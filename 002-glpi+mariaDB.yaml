@@ -1,0 +1,225 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: glpi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: glpi-secret
+  namespace: glpi
+type: Opaque
+stringData:
+  # Variaveis para o MariaDB
+  MARIADB_ROOT_PASSWORD: "glpi_password"
+  MARIADB_DATABASE: "glpidb"
+  MARIADB_USER: "glpi_user"
+  MARIADB_PASSWORD: "glpi_password"
+  # Variaveis para o GLPI (compatibilidade de nomenclaturas)
+  GLPI_DB_HOST: "mariadb"
+  GLPI_DB_PORT: "3306"
+  GLPI_DB_NAME: "glpidb"
+  GLPI_DB_USER: "glpi_user"
+  GLPI_DB_PASSWORD: "glpi_password"
+  GLPI_DATABASE_HOST: "mariadb"
+  GLPI_DATABASE_PORT: "3306"
+  GLPI_DATABASE_NAME: "glpidb"
+  GLPI_DATABASE_USER: "glpi_user"
+  GLPI_DATABASE_PASSWORD: "glpi_password"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mariadb
+  namespace: glpi
+spec:
+  clusterIP: None
+  selector:
+    app: mariadb
+  ports:
+  - port: 3306
+    targetPort: 3306
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mariadb
+  namespace: glpi
+spec:
+  serviceName: mariadb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mariadb
+  template:
+    metadata:
+      labels:
+        app: mariadb
+    spec:
+      containers:
+      - name: mariadb
+        image: mariadb:11.4
+        envFrom:
+        - secretRef:
+            name: glpi-secret
+        ports:
+        - containerPort: 3306
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command: ["healthcheck.sh", "--connect", "--innodb_initialized"]
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["healthcheck.sh", "--connect"]
+          initialDelaySeconds: 30
+          periodSeconds: 20
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/mysql
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: glpi-data
+  namespace: glpi
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glpi
+  namespace: glpi
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: glpi
+  template:
+    metadata:
+      labels:
+        app: glpi
+    spec:
+      initContainers:
+      - name: fix-permissions
+        image: busybox
+        command: ["sh", "-c", "chown -R 33:33 /var/glpi"]
+        volumeMounts:
+        - name: data
+          mountPath: /var/glpi
+      - name: wait-for-mariadb
+        image: busybox
+        command: ['sh', '-c', 'until nc -z mariadb 3306; do echo "Aguardando MariaDB..."; sleep 3; done;']
+      - name: auto-install-glpi
+        image: glpi/glpi:latest
+        envFrom:
+        - secretRef:
+            name: glpi-secret
+        command:
+        - sh
+        - -c
+        - |
+          if [ ! -f /var/glpi/config/config_db.php ] && [ ! -f /etc/glpi/config_db.php ]; then
+            php bin/console glpi:database:install --db-host=$GLPI_DB_HOST --db-name=$GLPI_DB_NAME --db-user=$GLPI_DB_USER --db-password=$GLPI_DB_PASSWORD --no-interaction --force || true
+          fi
+        volumeMounts:
+        - name: data
+          mountPath: /var/glpi
+      containers:
+      - name: glpi
+        image: glpi/glpi:latest
+        envFrom:
+        - secretRef:
+            name: glpi-secret
+        ports:
+        - containerPort: 80
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        volumeMounts:
+        - name: data
+          mountPath: /var/glpi
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: glpi-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glpi
+  namespace: glpi
+spec:
+  selector:
+    app: glpi
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: glpi-local-issuer
+  namespace: glpi
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: glpi-cert
+  namespace: glpi
+spec:
+  secretName: glpi-tls
+  dnsNames:
+  - glpi.app.local
+  issuerRef:
+    name: glpi-local-issuer
+    kind: Issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: glpi-ingress
+  namespace: glpi
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - glpi.app.local
+    secretName: glpi-tls
+  rules:
+  - host: glpi.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: glpi
+            port:
+              number: 80

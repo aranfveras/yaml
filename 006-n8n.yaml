@@ -1,0 +1,153 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: n8n
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: n8n-secret
+  namespace: n8n
+type: Opaque
+stringData:
+  N8N_HOST: "n8n.app.local"
+  N8N_PORT: "5678"
+  N8N_PROTOCOL: "https"
+  WEBHOOK_URL: "https://n8n.app.local/"
+  GENERIC_TIMEZONE: "America/Sao_Paulo"
+  # Chave de criptografia dos dados sensiveis salvos nos workflows do n8n
+  N8N_ENCRYPTION_KEY: "S3cur3N8n3ncrypt10nK3y2026!"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: n8n-pvc
+  namespace: n8n
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: n8n
+  namespace: n8n
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: n8n
+  template:
+    metadata:
+      labels:
+        app: n8n
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+      initContainers:
+      - name: fix-n8n-permissions
+        image: busybox:1.36
+        command: ["sh", "-c", "chown -R 1000:1000 /home/node/.n8n"]
+        securityContext:
+          runAsUser: 0
+        volumeMounts:
+        - name: data
+          mountPath: /home/node/.n8n
+      containers:
+      - name: n8n
+        image: n8nio/n8n:2.34.0
+        envFrom:
+        - secretRef:
+            name: n8n-secret
+        ports:
+        - containerPort: 5678
+          name: http
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 5678
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 5678
+          initialDelaySeconds: 30
+          periodSeconds: 15
+        resources:
+          requests:
+            cpu: 500m
+            memory: 512Mi
+          limits:
+            memory: 2048Mi
+        volumeMounts:
+        - name: data
+          mountPath: /home/node/.n8n
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: n8n-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: n8n
+  namespace: n8n
+spec:
+  selector:
+    app: n8n
+  ports:
+  - port: 5678
+    targetPort: 5678
+    name: http
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: n8n-local-issuer
+  namespace: n8n
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: n8n-cert
+  namespace: n8n
+spec:
+  secretName: n8n-tls
+  dnsNames:
+  - n8n.app.local
+  issuerRef:
+    name: n8n-local-issuer
+    kind: Issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: n8n-ingress
+  namespace: n8n
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - n8n.app.local
+    secretName: n8n-tls
+  rules:
+  - host: n8n.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: n8n
+            port:
+              number: 5678

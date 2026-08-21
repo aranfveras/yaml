@@ -1,0 +1,242 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: grafana
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: grafana-secret
+  namespace: grafana
+type: Opaque
+stringData:
+  POSTGRES_USER: "grafana"
+  POSTGRES_PASSWORD: "grafana_password"
+  POSTGRES_DB: "grafana"
+  GF_SECURITY_ADMIN_USER: "admin"
+  GF_SECURITY_ADMIN_PASSWORD: "admin"
+  GF_DATABASE_TYPE: "postgres"
+  GF_DATABASE_HOST: "postgres-grafana:5432"
+  GF_DATABASE_NAME: "grafana"
+  GF_DATABASE_USER: "grafana"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-grafana
+  namespace: grafana
+spec:
+  clusterIP: None
+  selector:
+    app: postgres-grafana
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-grafana
+  namespace: grafana
+spec:
+  serviceName: postgres-grafana
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-grafana
+  template:
+    metadata:
+      labels:
+        app: postgres-grafana
+    spec:
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      containers:
+      - name: postgres
+        image: postgres:16.6
+        envFrom:
+        - secretRef:
+            name: grafana-secret
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "grafana", "-d", "grafana"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "grafana", "-d", "grafana"]
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: grafana-pvc
+  namespace: grafana
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grafana
+  namespace: grafana
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: grafana
+  template:
+    metadata:
+      labels:
+        app: grafana
+    spec:
+      securityContext:
+        fsGroup: 472
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox
+        command: ['sh', '-c', 'until nc -z postgres-grafana 5432; do echo "Aguardando PostgreSQL..."; sleep 3; done;']
+      containers:
+      - name: grafana
+        image: grafana/grafana:11.5.0
+        envFrom:
+        - secretRef:
+            name: grafana-secret
+        env:
+        - name: GF_DATABASE_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: grafana-secret
+              key: POSTGRES_PASSWORD
+        ports:
+        - containerPort: 3000
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        securityContext:
+          runAsUser: 472
+          runAsGroup: 472
+          allowPrivilegeEscalation: false
+        readinessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /api/health
+            port: 3000
+          initialDelaySeconds: 30
+          periodSeconds: 20
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/grafana
+      volumes:
+      - name: data
+        persistentVolumeClaim:
+          claimName: grafana-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: grafana
+  namespace: grafana
+spec:
+  selector:
+    app: grafana
+  ports:
+  - port: 3000
+    targetPort: 3000
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: grafana-local-issuer
+  namespace: grafana
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: grafana-cert
+  namespace: grafana
+spec:
+  secretName: grafana-tls
+  dnsNames:
+  - grafana.app.local
+  issuerRef:
+    name: grafana-local-issuer
+    kind: Issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: grafana-ingress
+  namespace: grafana
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - grafana.app.local
+    secretName: grafana-tls
+  rules:
+  - host: grafana.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: grafana
+            port:
+              number: 3000

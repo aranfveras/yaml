@@ -1,0 +1,580 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: prometheus
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: prometheus
+rules:
+- apiGroups: [""]
+  resources: ["nodes", "nodes/metrics", "services", "endpoints", "pods", "configmaps", "namespaces"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["apps"]
+  resources: ["deployments", "replicasets", "statefulsets", "daemonsets"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: ["networking.k8s.io"]
+  resources: ["ingresses"]
+  verbs: ["get", "list", "watch"]
+- nonResourceURLs: ["/metrics", "/metrics/cadvisor"]
+  verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: prometheus
+subjects:
+- kind: ServiceAccount
+  name: prometheus
+  namespace: prometheus
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prometheus-basic-auth
+  namespace: prometheus
+type: Opaque
+stringData:
+  users: |
+    api_user:$2y$05$Y3bJmrLTyzGvEKcfBhTDoeRiZUbHXv/3f9C9KE8uHobJ9ojkDiS/C
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: prometheus
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 30s
+      evaluation_interval: 30s
+
+    alerting:
+      alertmanagers:
+        - static_configs:
+            - targets:
+              - alertmanager.prometheus.svc.cluster.local:9093
+
+    rule_files:
+      - /etc/prometheus/alerts.yml
+
+    scrape_configs:
+      - job_name: prometheus
+        static_configs:
+          - targets: ["localhost:9090"]
+
+      - job_name: node-exporter
+        kubernetes_sd_configs:
+          - role: endpoints
+            namespaces:
+              names:
+                - prometheus
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_service_name]
+            action: keep
+            regex: node-exporter
+          - source_labels: [__meta_kubernetes_endpoint_port_name]
+            action: keep
+            regex: metrics
+
+      - job_name: kube-state-metrics
+        static_configs:
+          - targets: ["kube-state-metrics.prometheus.svc.cluster.local:8080"]
+
+      - job_name: kubernetes-nodes-cadvisor
+        kubernetes_sd_configs:
+          - role: node
+        scheme: https
+        tls_config:
+          insecure_skip_verify: true
+        authorization:
+          credentials_file: /var/run/secrets/kubernetes.io/serviceaccount/token
+        relabel_configs:
+          - action: labelmap
+            regex: __meta_kubernetes_node_label_(.+)
+          - target_label: __metrics_path__
+            replacement: /metrics/cadvisor
+
+      - job_name: kubernetes-pods
+        kubernetes_sd_configs:
+          - role: pod
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+            action: keep
+            regex: true
+          - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+            action: replace
+            target_label: __metrics_path__
+            regex: (.+)
+          - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+            action: replace
+            regex: ([^:]+)(?::\d+)?;(\d+)
+            replacement: $1:$2
+            target_label: __address__
+
+  alerts.yml: |
+    groups:
+      - name: infrastructure
+        rules:
+          - alert: TargetDown
+            expr: up == 0
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "Target {{ $labels.job }} / {{ $labels.instance }} down"
+              description: "O target não responde há mais de 2 minutos."
+
+          - alert: HighCPU
+            expr: 100 - (avg by(instance) (rate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 90
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "CPU alta em {{ $labels.instance }}"
+              description: "Uso de CPU acima de 90% por 5 minutos."
+
+          - alert: HighMemory
+            expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 90
+            for: 5m
+            labels:
+              severity: warning
+            annotations:
+              summary: "Memória alta em {{ $labels.instance }}"
+              description: "Uso de memória acima de 90% por 5 minutos."
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: prometheus
+spec:
+  clusterIP: None
+  selector:
+    app: prometheus
+  ports:
+  - port: 9090
+    targetPort: 9090
+    name: http
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: prometheus
+  namespace: prometheus
+spec:
+  serviceName: prometheus
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus
+  template:
+    metadata:
+      labels:
+        app: prometheus
+    spec:
+      serviceAccountName: prometheus
+      securityContext:
+        fsGroup: 65534
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v3.11.2
+        args:
+          - --config.file=/etc/prometheus/prometheus.yml
+          - --storage.tsdb.path=/prometheus
+          - --storage.tsdb.retention.time=7d
+          - --web.enable-remote-write-receiver
+          - --web.enable-lifecycle
+        ports:
+        - containerPort: 9090
+          name: http
+        resources:
+          requests:
+            cpu: 150m
+            memory: 256Mi
+          limits:
+            memory: 1Gi
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9090
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 15
+        volumeMounts:
+        - name: config
+          mountPath: /etc/prometheus
+        - name: data
+          mountPath: /prometheus
+      volumes:
+      - name: config
+        configMap:
+          name: prometheus-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 5Gi
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-exporter
+  namespace: prometheus
+spec:
+  selector:
+    matchLabels:
+      app: node-exporter
+  template:
+    metadata:
+      labels:
+        app: node-exporter
+    spec:
+      hostNetwork: true
+      hostPID: true
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: node-exporter
+        image: prom/node-exporter:v1.9.1
+        args:
+          - --path.procfs=/host/proc
+          - --path.sysfs=/host/sys
+          - --path.rootfs=/host/root
+          - --collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)
+        ports:
+        - containerPort: 9100
+          name: metrics
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+        volumeMounts:
+        - name: proc
+          mountPath: /host/proc
+          readOnly: true
+        - name: sys
+          mountPath: /host/sys
+          readOnly: true
+        - name: root
+          mountPath: /host/root
+          readOnly: true
+          mountPropagation: HostToContainer
+      volumes:
+      - name: proc
+        hostPath:
+          path: /proc
+      - name: sys
+        hostPath:
+          path: /sys
+      - name: root
+        hostPath:
+          path: /
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: node-exporter
+  namespace: prometheus
+  labels:
+    app: node-exporter
+spec:
+  clusterIP: None
+  selector:
+    app: node-exporter
+  ports:
+  - port: 9100
+    targetPort: 9100
+    name: metrics
+---
+# --- KUBE-STATE-METRICS COMPONENTS ---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kube-state-metrics
+  namespace: prometheus
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kube-state-metrics
+rules:
+- apiGroups: [""]
+  resources:
+    - configmaps
+    - secrets
+    - nodes
+    - pods
+    - services
+    - resourcequotas
+    - replicationcontrollers
+    - limitranges
+    - persistentvolumeclaims
+    - persistentvolumes
+    - namespaces
+    - endpoints
+  verbs: ["list", "watch"]
+- apiGroups: ["apps"]
+  resources:
+    - statefulsets
+    - daemonsets
+    - deployments
+    - replicasets
+  verbs: ["list", "watch"]
+- apiGroups: ["batch"]
+  resources:
+    - cronjobs
+    - jobs
+  verbs: ["list", "watch"]
+- apiGroups: ["storage.k8s.io"]
+  resources:
+    - storageclasses
+    - volumeattachments
+  verbs: ["list", "watch"]
+- apiGroups: ["policy"]
+  resources:
+    - poddisruptionbudgets
+  verbs: ["list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kube-state-metrics
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kube-state-metrics
+subjects:
+- kind: ServiceAccount
+  name: kube-state-metrics
+  namespace: prometheus
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kube-state-metrics
+  namespace: prometheus
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kube-state-metrics
+  template:
+    metadata:
+      labels:
+        app: kube-state-metrics
+    spec:
+      serviceAccountName: kube-state-metrics
+      containers:
+      - name: kube-state-metrics
+        image: registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.14.0
+        ports:
+        - containerPort: 8080
+          name: http-metrics
+        - containerPort: 8081
+          name: telemetry
+        resources:
+          requests:
+            cpu: 10m
+            memory: 64Mi
+          limits:
+            cpu: 100m
+            memory: 256Mi
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+          runAsUser: 65534
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kube-state-metrics
+  namespace: prometheus
+  labels:
+    app: kube-state-metrics
+spec:
+  ports:
+  - name: http-metrics
+    port: 8080
+    targetPort: http-metrics
+  - name: telemetry
+    port: 8081
+    targetPort: telemetry
+  selector:
+    app: kube-state-metrics
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: alertmanager-config
+  namespace: prometheus
+data:
+  alertmanager.yml: |
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: default
+      group_by: ["alertname", "severity"]
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 4h
+    receivers:
+      - name: default
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: alertmanager
+  namespace: prometheus
+spec:
+  clusterIP: None
+  selector:
+    app: alertmanager
+  ports:
+  - port: 9093
+    targetPort: 9093
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: alertmanager
+  namespace: prometheus
+spec:
+  serviceName: alertmanager
+  replicas: 1
+  selector:
+    matchLabels:
+      app: alertmanager
+  template:
+    metadata:
+      labels:
+        app: alertmanager
+    spec:
+      securityContext:
+        fsGroup: 65534
+        runAsUser: 65534
+        runAsNonRoot: true
+      containers:
+      - name: alertmanager
+        image: prom/alertmanager:v0.28.1
+        args:
+          - --config.file=/etc/alertmanager/alertmanager.yml
+          - --storage.path=/alertmanager
+        ports:
+        - containerPort: 9093
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 256Mi
+        readinessProbe:
+          httpGet:
+            path: /-/ready
+            port: 9093
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        livenessProbe:
+          httpGet:
+            path: /-/healthy
+            port: 9093
+          initialDelaySeconds: 30
+          periodSeconds: 15
+        volumeMounts:
+        - name: config
+          mountPath: /etc/alertmanager
+        - name: data
+          mountPath: /alertmanager
+      volumes:
+      - name: config
+        configMap:
+          name: alertmanager-config
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 1Gi
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: prometheus-local-issuer
+  namespace: prometheus
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: prometheus-cert
+  namespace: prometheus
+spec:
+  secretName: prometheus-tls
+  dnsNames:
+  - prometheus.app.local
+  issuerRef:
+    name: prometheus-local-issuer
+    kind: Issuer
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: prometheus-auth
+  namespace: prometheus
+spec:
+  basicAuth:
+    secret: prometheus-basic-auth
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus-ingress
+  namespace: prometheus
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: prometheus-prometheus-auth@kubernetescrd
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - prometheus.app.local
+    secretName: prometheus-tls
+  rules:
+  - host: prometheus.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: prometheus
+            port:
+              number: 9090

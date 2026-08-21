@@ -1,0 +1,273 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: zabbix
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: zabbix-secret
+  namespace: zabbix
+type: Opaque
+stringData:
+  # Variaveis do PostgreSQL
+  POSTGRES_USER: "zabbix"
+  POSTGRES_PASSWORD: "zabbix_password"
+  POSTGRES_DB: "zabbix"
+  # Variaveis de Integracao
+  DB_SERVER_HOST: "postgres-zabbix"
+  ZBX_SERVER_HOST: "zabbix-server"
+  PHP_TZ: "America/Sao_Paulo"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-zabbix
+  namespace: zabbix
+spec:
+  clusterIP: None
+  selector:
+    app: postgres-zabbix
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres-zabbix
+  namespace: zabbix
+spec:
+  serviceName: postgres-zabbix
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres-zabbix
+  template:
+    metadata:
+      labels:
+        app: postgres-zabbix
+    spec:
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      containers:
+      - name: postgres
+        image: postgres:16.6
+        envFrom:
+        - secretRef:
+            name: zabbix-secret
+        ports:
+        - containerPort: 5432
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "zabbix", "-d", "zabbix"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "zabbix", "-d", "zabbix"]
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 3Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zabbix-server
+  namespace: zabbix
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: zabbix-server
+  template:
+    metadata:
+      labels:
+        app: zabbix-server
+    spec:
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox
+        command: ['sh', '-c', 'until nc -z postgres-zabbix 5432; do echo "Aguardando PostgreSQL..."; sleep 3; done;']
+      containers:
+      - name: zabbix-server
+        image: zabbix/zabbix-server-pgsql:alpine-7.0-latest
+        envFrom:
+        - secretRef:
+            name: zabbix-secret
+        ports:
+        - containerPort: 10051
+        resources:
+          requests:
+            cpu: 150m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+      - name: zabbix-agent
+        image: zabbix/zabbix-agent2:alpine-7.0-latest
+        env:
+        - name: ZBX_HOSTNAME
+          value: "Zabbix server"
+        - name: ZBX_SERVER_HOST
+          value: "127.0.0.1"
+        ports:
+        - containerPort: 10050
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zabbix-server
+  namespace: zabbix
+spec:
+  selector:
+    app: zabbix-server
+  ports:
+  - port: 10051
+    targetPort: 10051
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: zabbix-web
+  namespace: zabbix
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: zabbix-web
+  template:
+    metadata:
+      labels:
+        app: zabbix-web
+    spec:
+      tolerations:
+      - key: "node.kubernetes.io/not-ready"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      - key: "node.kubernetes.io/unreachable"
+        operator: "Exists"
+        effect: "NoExecute"
+        tolerationSeconds: 30
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox
+        command: ['sh', '-c', 'until nc -z postgres-zabbix 5432; do echo "Aguardando PostgreSQL..."; sleep 3; done;']
+      - name: wait-for-zabbix-server
+        image: busybox
+        command: ['sh', '-c', 'until nc -z zabbix-server 10051; do echo "Aguardando Zabbix Server..."; sleep 3; done;']
+      containers:
+      - name: zabbix-web
+        image: zabbix/zabbix-web-nginx-pgsql:alpine-7.0-latest
+        envFrom:
+        - secretRef:
+            name: zabbix-secret
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: zabbix-web
+  namespace: zabbix
+spec:
+  selector:
+    app: zabbix-web
+  ports:
+  - port: 8080
+    targetPort: 8080
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: zabbix-local-issuer
+  namespace: zabbix
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: zabbix-cert
+  namespace: zabbix
+spec:
+  secretName: zabbix-tls
+  dnsNames:
+  - zabbix.app.local
+  issuerRef:
+    name: zabbix-local-issuer
+    kind: Issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: zabbix-ingress
+  namespace: zabbix
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - zabbix.app.local
+    secretName: zabbix-tls
+  rules:
+  - host: zabbix.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: zabbix-web
+            port:
+              number: 8080

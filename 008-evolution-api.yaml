@@ -1,0 +1,290 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: evolution
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: evolution-secret
+  namespace: evolution
+type: Opaque
+stringData:
+  # ==============================================================================
+  # GERENCIAMENTO DE AUTENTICAÇÃO (API KEY)
+  # Para alterar a chave de acesso da API no futuro:
+  # 1. Substitua o valor de AUTHENTICATION_API_KEY abaixo.
+  # 2. Aplique o manifesto (kubectl apply -f ...).
+  # 3. Reinicie o deployment: kubectl rollout restart deployment/evolution-api -n evolution
+  # Nas chamadas HTTP, envie o header: "apikey: EvoAPISecretKey2026ChangeMe!"
+  # ==============================================================================
+  AUTHENTICATION_TYPE: "apikey"
+  AUTHENTICATION_API_KEY: "EvoAPISecretKey2026ChangeMe!"
+  
+  # Banco de Dados
+  POSTGRES_USER: "evolution"
+  POSTGRES_DB: "evolution"
+  POSTGRES_PASSWORD: "Senh@1324"
+  DATABASE_CONNECTION_URI: "postgresql://evolution:Senh%401324@evolution-postgres:5432/evolution?sslmode=disable"
+  
+  # Parametros Globais da Evolution API v2.x
+  SERVER_URL: "https://evolution.app.local"
+  DATABASE_ENABLED: "true"
+  DATABASE_PROVIDER: "postgresql"
+  DATABASE_SAVE_DATA_INSTANCE: "true"
+  DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+  CACHE_REDIS_ENABLED: "true"
+  CACHE_REDIS_URI: "redis://evolution-redis:6379/1"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: evolution-instances-pvc
+  namespace: evolution
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evolution-postgres
+  namespace: evolution
+spec:
+  clusterIP: None
+  selector:
+    app: evolution-postgres
+  ports:
+  - port: 5432
+    targetPort: 5432
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: evolution-postgres
+  namespace: evolution
+spec:
+  serviceName: evolution-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: evolution-postgres
+  template:
+    metadata:
+      labels:
+        app: evolution-postgres
+    spec:
+      containers:
+      - name: postgres
+        image: postgres:16.6
+        envFrom:
+        - secretRef:
+            name: evolution-secret
+        ports:
+        - containerPort: 5432
+          name: postgres
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          exec:
+            command: ["pg_isready", "-U", "evolution"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["pg_isready", "-U", "evolution"]
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        volumeMounts:
+        - name: data
+          mountPath: /var/lib/postgresql/data
+          subPath: pgdata
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+    spec:
+      accessModes: ["ReadWriteOnce"]
+      resources:
+        requests:
+          storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evolution-redis
+  namespace: evolution
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: evolution-redis
+  template:
+    metadata:
+      labels:
+        app: evolution-redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+          name: redis
+        resources:
+          requests:
+            cpu: 50m
+            memory: 64Mi
+          limits:
+            memory: 128Mi
+        readinessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        livenessProbe:
+          exec:
+            command: ["redis-cli", "ping"]
+          initialDelaySeconds: 15
+          periodSeconds: 20
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evolution-redis
+  namespace: evolution
+spec:
+  selector:
+    app: evolution-redis
+  ports:
+  - port: 6379
+    targetPort: 6379
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evolution-api
+  namespace: evolution
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: evolution-api
+  template:
+    metadata:
+      labels:
+        app: evolution-api
+    spec:
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z -w 2 evolution-postgres 5432; do echo "Aguardando PostgreSQL..."; sleep 2; done;']
+      - name: wait-for-redis
+        image: busybox:1.36
+        command: ['sh', '-c', 'until nc -z -w 2 evolution-redis 6379; do echo "Aguardando Redis..."; sleep 2; done;']
+      containers:
+      - name: evolution-api
+        image: evoapicloud/evolution-api:v2.3.7
+        envFrom:
+        - secretRef:
+            name: evolution-secret
+        ports:
+        - containerPort: 8080
+          name: http
+        resources:
+          requests:
+            cpu: 150m
+            memory: 256Mi
+          limits:
+            memory: 512Mi
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 5
+          failureThreshold: 5
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 8080
+          initialDelaySeconds: 60
+          periodSeconds: 20
+          timeoutSeconds: 5
+          failureThreshold: 5
+        volumeMounts:
+        - name: instances-data
+          mountPath: /evolution/instances
+      volumes:
+      - name: instances-data
+        persistentVolumeClaim:
+          claimName: evolution-instances-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: evolution-api
+  namespace: evolution
+spec:
+  selector:
+    app: evolution-api
+  ports:
+  - port: 8080
+    targetPort: 8080
+    name: http
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: evolution-local-issuer
+  namespace: evolution
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: evolution-cert
+  namespace: evolution
+spec:
+  secretName: evolution-tls
+  dnsNames:
+  - evolution.app.local
+  issuerRef:
+    name: evolution-local-issuer
+    kind: Issuer
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: evolution-ingress
+  namespace: evolution
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - evolution.app.local
+    secretName: evolution-tls
+  rules:
+  - host: evolution.app.local
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: evolution-api
+            port:
+              number: 8080
